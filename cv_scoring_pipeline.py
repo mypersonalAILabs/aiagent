@@ -17,6 +17,8 @@ PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_ENV = os.environ.get("PINECONE_ENVIRONMENT")
 CORRELATION_ID = os.environ.get("CORRELATION_ID")
 
+MAX_METADATA_BYTES = 40960
+
 # --- Init Pinecone and Index ---
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(host='https://cv-matching-index-xihp51s.svc.aped-4627-b74a.pinecone.io')
@@ -48,8 +50,8 @@ def store_embeddings(correlation_id, cv_text, jd_text):
     embedding_model = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
     texts = [cv_text, jd_text]
     metadatas = [
-        {"correlation_id": correlation_id, "type": "cv"},
-        {"correlation_id": correlation_id, "type": "jd"}
+        truncate_metadata({"correlation_id": correlation_id, "type": "cv"}),
+        truncate_metadata({"correlation_id": correlation_id, "type": "jd"})
     ]
     db = PineconeVectorStore(index=index, embedding=embedding_model, text_key="text")
     db.add_texts(texts=texts, metadatas=metadatas)
@@ -85,6 +87,25 @@ def match_cv_with_jd(correlation_id):
     chain = LLMChain(llm=llm, prompt=prompt_template)
     result = chain.run({"jd": jd_text, "cv": cv_text})
     return result
+
+def truncate_metadata(metadata):
+    import json
+    while True:
+        serialized = json.dumps(metadata)
+        if len(serialized.encode("utf-8")) <= MAX_METADATA_BYTES:
+            return metadata
+        # truncate fields
+        if 'correlation_id' in metadata:
+            metadata['correlation_id'] = metadata['correlation_id'][:36]  # UUID size
+        if 'type' in metadata and len(metadata['type']) > 10:
+            metadata['type'] = metadata['type'][:10]
+        # remove any extra fields if needed
+        keys = list(metadata.keys())
+        for k in keys:
+            if k not in ['correlation_id', 'type']:
+                del metadata[k]
+                break
+
 
 # --- Main Execution ---
 if __name__ == "__main__":
