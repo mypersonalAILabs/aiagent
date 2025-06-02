@@ -9,6 +9,9 @@ from langchain.chains import LLMChain
 from langchain.chat_models import ChatOpenAI
 from PyPDF2 import PdfReader
 import docx2txt
+import json
+import zlib
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # --- Load environment variables ---
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME")
@@ -45,30 +48,51 @@ def extract_text_from_file(file_path):
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
 
-# --- Store Embeddings ---
+# --- Truncate metadata with compression ---
+def truncate_metadata(metadata):
+    allowed_keys = {'correlation_id', 'type', 'chunk'}
+    metadata = {k: v for k, v in metadata.items() if k in allowed_keys}
+
+    compressed = zlib.compress(json.dumps(metadata).encode('utf-8'))
+    if len(compressed) <= MAX_METADATA_BYTES:
+        return metadata
+
+    if 'correlation_id' in metadata:
+        metadata['correlation_id'] = metadata['correlation_id'][:36]
+    if 'type' in metadata:
+        metadata['type'] = metadata['type'][:10]
+    if 'chunk' in metadata:
+        metadata['chunk'] = int(metadata['chunk'])
+
+    return metadata
+
+# --- Store Embeddings with chunking ---
 def store_embeddings(correlation_id, cv_text, jd_text):
     embedding_model = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-    texts = [cv_text, jd_text]
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    cv_chunks = splitter.split_text(cv_text)
+    jd_chunks = splitter.split_text(jd_text)
+
+    texts = cv_chunks + jd_chunks
     metadatas = [
-        truncate_metadata({"correlation_id": correlation_id, "type": "cv"}),
-        truncate_metadata({"correlation_id": correlation_id, "type": "jd"})
+        truncate_metadata({"correlation_id": correlation_id, "type": "cv", "chunk": i}) for i in range(len(cv_chunks))
+    ] + [
+        truncate_metadata({"correlation_id": correlation_id, "type": "jd", "chunk": i}) for i in range(len(jd_chunks))
     ]
+
     db = PineconeVectorStore(index=index, embedding=embedding_model, text_key="text")
     db.add_texts(texts=texts, metadatas=metadatas)
 
 # --- Match CV with JD ---
-def match_cv_with_jd(correlation_id):
+def match_cv_with_jd(correlation_id, fallback_jd_text, fallback_cv_text):
     embedding_model = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
     db = PineconeVectorStore(index=index, embedding=embedding_model, text_key="text")
 
     results = db.similarity_search(query="", k=1, filter={"correlation_id": correlation_id, "type": "jd"})
-    jd_text = results[0].page_content if results else ""
+    jd_text = results[0].page_content if results else fallback_jd_text
 
     matches = db.similarity_search(jd_text, k=1, filter={"correlation_id": correlation_id, "type": "cv"})
-    cv_text = matches[0].page_content if matches else ""
-
-    if not jd_text or not cv_text:
-        return "Could not find matching JD or CV in the vector database."
+    cv_text = matches[0].page_content if matches else fallback_cv_text
 
     prompt_template = PromptTemplate(
         input_variables=["jd", "cv"],
@@ -87,25 +111,6 @@ def match_cv_with_jd(correlation_id):
     chain = LLMChain(llm=llm, prompt=prompt_template)
     result = chain.run({"jd": jd_text, "cv": cv_text})
     return result
-
-def truncate_metadata(metadata):
-    import json
-    while True:
-        serialized = json.dumps(metadata)
-        if len(serialized.encode("utf-8")) <= MAX_METADATA_BYTES:
-            return metadata
-        # truncate fields
-        if 'correlation_id' in metadata:
-            metadata['correlation_id'] = metadata['correlation_id'][:36]  # UUID size
-        if 'type' in metadata and len(metadata['type']) > 10:
-            metadata['type'] = metadata['type'][:10]
-        # remove any extra fields if needed
-        keys = list(metadata.keys())
-        for k in keys:
-            if k not in ['correlation_id', 'type']:
-                del metadata[k]
-                break
-
 
 # --- Main Execution ---
 if __name__ == "__main__":
@@ -130,7 +135,7 @@ if __name__ == "__main__":
     store_embeddings(CORRELATION_ID, cv_text, jd_text)
 
     print("Matching CV and JD...")
-    result = match_cv_with_jd(CORRELATION_ID)
+    result = match_cv_with_jd(CORRELATION_ID, jd_text, cv_text)
     print("Result:", result)
 
     result_key = f"results/{CORRELATION_ID}_result.txt"
