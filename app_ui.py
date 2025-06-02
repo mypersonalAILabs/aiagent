@@ -3,15 +3,22 @@ import boto3
 import uuid
 import io
 import time
+import base64
+
+# --- Auth Setup ---
+VALID_USERNAME = base64.b64encode(b"admin").decode("utf-8")
+VALID_PASSWORD = base64.b64encode(b"Zt82$wQ9pL@c!rM3").decode("utf-8")  # Secure password
+
+def authenticate(username, password):
+    encoded_user = base64.b64encode(username.encode("utf-8")).decode("utf-8")
+    encoded_pass = base64.b64encode(password.encode("utf-8")).decode("utf-8")
+    return encoded_user == VALID_USERNAME and encoded_pass == VALID_PASSWORD
 
 # --- Page Setup ---
 st.set_page_config(page_title="CV Fit Evaluator", layout="centered")
+
 st.markdown("""
     <style>
-        body {
-            background-color: #f0f2f6;
-            font-family: 'Segoe UI', sans-serif;
-        }
         .reportview-container .main .block-container {
             padding-top: 2rem;
             padding-bottom: 2rem;
@@ -28,9 +35,6 @@ st.markdown("""
             padding: 0.6em 1.2em;
             font-size: 16px;
         }
-        .stTextInput, .stTextArea, .stFileUploader {
-            margin-bottom: 1rem;
-        }
         .result-box {
             background-color: #e6f4ea;
             padding: 1em;
@@ -43,6 +47,23 @@ st.markdown("""
 
 st.title("📄 AI-Powered CV Fit Evaluator")
 
+# --- Authentication ---
+st.markdown("### 🔐 Login")
+with st.form("auth_form"):
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    submitted = st.form_submit_button("Login")
+
+if submitted:
+    if authenticate(username, password):
+        st.session_state["authenticated"] = True
+        st.success("✅ Authentication successful")
+    else:
+        st.error("❌ Invalid credentials")
+
+if not st.session_state.get("authenticated"):
+    st.stop()
+
 st.markdown("""
 #### 🚀 How it works:
 1. Upload a candidate's CV (.pdf or .docx)
@@ -53,35 +74,23 @@ st.markdown("""
 ---
 """)
 
-# --- File Uploader for CV ---
 cv_file = st.file_uploader("📤 Upload Candidate's CV (.pdf or .docx)", type=["pdf", "docx"])
-
-# --- Text Area for Job Description ---
 job_description = st.text_area("📝 Paste the Job Description", height=200)
 
-# AWS S3 Configuration
 S3_BUCKET = "cvfitment"
 S3_REGION = "us-east-1"
 s3 = boto3.client("s3", region_name=S3_REGION)
 
 def upload_cv_and_jd_to_s3(cv_file, jd_text):
-    # Generate shared UUID for correlation
     shared_id = str(uuid.uuid4())
-
-    # Upload CV
     cv_extension = cv_file.name.split('.')[-1]
     cv_key = f"uploads/{shared_id}_cv.{cv_extension}"
     s3.upload_fileobj(cv_file, S3_BUCKET, cv_key)
-
-    # Upload Job Description as text
     jd_key = f"uploads/{shared_id}_job-description.txt"
     jd_bytes = io.BytesIO(jd_text.encode("utf-8"))
     s3.upload_fileobj(jd_bytes, S3_BUCKET, jd_key)
-
-    # Upload ready flag
     flag_key = f"uploads/{shared_id}_ready.flag"
     s3.put_object(Bucket=S3_BUCKET, Key=flag_key, Body=b"ready")
-
     return {
         "cv_s3_uri": f"s3://{S3_BUCKET}/{cv_key}",
         "jd_s3_uri": f"s3://{S3_BUCKET}/{jd_key}",
@@ -108,9 +117,11 @@ if st.button("🔍 Evaluate Fit"):
             st.info(f"Correlation ID: {result['correlation_id']}")
 
         correlation_id = result['correlation_id']
+        st.session_state["last_correlation_id"] = correlation_id
 
         with st.spinner("⏳ Waiting for result from ECS pipeline..."):
-            for _ in range(60):  # ~60 seconds
+            start = time.time()
+            for _ in range(60):
                 match_result = get_result_from_s3(correlation_id)
                 if match_result:
                     st.balloons()
@@ -123,9 +134,11 @@ if st.button("🔍 Evaluate Fit"):
                     """, unsafe_allow_html=True)
                     break
                 time.sleep(1)
+                elapsed = int(time.time() - start)
+                st.info(f"⏱ Waited {elapsed}s so far...")
             else:
                 st.error("❌ Result not available. Please try again later.")
+                st.info("You may retry after a minute if result doesn't appear.")
 
-# --- Footer ---
 st.markdown("---")
 st.markdown("<center>Built with ❤️ using LangChain, OpenAI & Streamlit</center>", unsafe_allow_html=True)
