@@ -9,9 +9,8 @@ from langchain.chains import LLMChain
 from langchain.chat_models import ChatOpenAI
 from PyPDF2 import PdfReader
 import docx2txt
-import json
-import zlib
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from tiktoken import encoding_for_model
 
 # --- Load environment variables ---
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME")
@@ -21,6 +20,8 @@ PINECONE_ENV = os.environ.get("PINECONE_ENVIRONMENT")
 CORRELATION_ID = os.environ.get("CORRELATION_ID")
 
 MAX_METADATA_BYTES = 40960
+MAX_TOKENS = 16385
+MODEL_NAME = "gpt-4"
 
 # --- Init Pinecone and Index ---
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -48,51 +49,74 @@ def extract_text_from_file(file_path):
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
 
-# --- Truncate metadata with compression ---
-def truncate_metadata(metadata):
-    allowed_keys = {'correlation_id', 'type', 'chunk'}
-    metadata = {k: v for k, v in metadata.items() if k in allowed_keys}
-
-    compressed = zlib.compress(json.dumps(metadata).encode('utf-8'))
-    if len(compressed) <= MAX_METADATA_BYTES:
-        return metadata
-
-    if 'correlation_id' in metadata:
-        metadata['correlation_id'] = metadata['correlation_id'][:36]
-    if 'type' in metadata:
-        metadata['type'] = metadata['type'][:10]
-    if 'chunk' in metadata:
-        metadata['chunk'] = int(metadata['chunk'])
-
-    return metadata
-
-# --- Store Embeddings with chunking ---
+# --- Store Embeddings ---
 def store_embeddings(correlation_id, cv_text, jd_text):
     embedding_model = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    cv_chunks = splitter.split_text(cv_text)
-    jd_chunks = splitter.split_text(jd_text)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=750, chunk_overlap=100)
+
+    cv_chunks = text_splitter.split_text(cv_text)
+    jd_chunks = text_splitter.split_text(jd_text)
 
     texts = cv_chunks + jd_chunks
-    metadatas = [
-        truncate_metadata({"correlation_id": correlation_id, "type": "cv", "chunk": i}) for i in range(len(cv_chunks))
-    ] + [
-        truncate_metadata({"correlation_id": correlation_id, "type": "jd", "chunk": i}) for i in range(len(jd_chunks))
-    ]
+    metadatas = [truncate_metadata({"correlation_id": correlation_id, "type": "cv"})] * len(cv_chunks) + \
+                [truncate_metadata({"correlation_id": correlation_id, "type": "jd"})] * len(jd_chunks)
 
     db = PineconeVectorStore(index=index, embedding=embedding_model, text_key="text")
     db.add_texts(texts=texts, metadatas=metadatas)
 
+# --- Token counter ---
+def count_tokens(text):
+    encoder = encoding_for_model(MODEL_NAME)
+    return len(encoder.encode(text))
+
+# --- Truncate JD and CV to fit within LLM context ---
+def truncate_to_fit_limit(jd_text, cv_text, max_tokens=MAX_TOKENS, reserved_for_prompt=2000):
+    encoder = encoding_for_model(MODEL_NAME)
+    limit = max_tokens - reserved_for_prompt
+    jd_tokens = encoder.encode(jd_text)
+    cv_tokens = encoder.encode(cv_text)
+
+    if len(jd_tokens) + len(cv_tokens) > limit:
+        jd_max = int(limit * 0.6)
+        cv_max = limit - jd_max
+        jd_tokens = jd_tokens[:jd_max]
+        cv_tokens = cv_tokens[:cv_max]
+
+    return encoder.decode(jd_tokens), encoder.decode(cv_tokens)
+
 # --- Match CV with JD ---
-def match_cv_with_jd(correlation_id, fallback_jd_text, fallback_cv_text):
+def match_cv_with_jd(correlation_id, cv_text, jd_text):
     embedding_model = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
     db = PineconeVectorStore(index=index, embedding=embedding_model, text_key="text")
 
-    results = db.similarity_search(query="", k=1, filter={"correlation_id": correlation_id, "type": "jd"})
-    jd_text = results[0].page_content if results else fallback_jd_text
+    results = db.similarity_search(query="", k=3, filter={"correlation_id": correlation_id, "type": "jd"})
+    jd_context = "\n".join([r.page_content for r in results]) if results else jd_text
 
-    matches = db.similarity_search(jd_text, k=1, filter={"correlation_id": correlation_id, "type": "cv"})
-    cv_text = matches[0].page_content if matches else fallback_cv_text
+    matches = db.similarity_search(jd_context, k=3, filter={"correlation_id": correlation_id, "type": "cv"})
+    cv_context = "\n".join([m.page_content for m in matches]) if matches else cv_text
+
+    tokens_used = count_tokens(jd_context) + count_tokens(cv_context)
+    remaining_tokens = MAX_TOKENS - tokens_used
+    chunk_allowance = int(remaining_tokens * 0.5)
+
+    global_jds, global_cvs = [], []
+    if remaining_tokens > 1000:
+        jds = db.similarity_search(jd_context, k=10, filter={"type": "jd"})
+        for j in jds:
+            if count_tokens(j.page_content) + tokens_used < chunk_allowance:
+                global_jds.append(j.page_content)
+                tokens_used += count_tokens(j.page_content)
+
+        cvs = db.similarity_search(cv_context, k=10, filter={"type": "cv"})
+        for c in cvs:
+            if count_tokens(c.page_content) + tokens_used < chunk_allowance:
+                global_cvs.append(c.page_content)
+                tokens_used += count_tokens(c.page_content)
+
+    augmented_jd = jd_context + "\n" + "\n".join(global_jds)
+    augmented_cv = cv_context + "\n" + "\n".join(global_cvs)
+
+    trimmed_jd, trimmed_cv = truncate_to_fit_limit(augmented_jd, augmented_cv)
 
     prompt_template = PromptTemplate(
         input_variables=["jd", "cv"],
@@ -103,14 +127,35 @@ def match_cv_with_jd(correlation_id, fallback_jd_text, fallback_cv_text):
         And the following candidate CV:
         {cv}
 
-        Provide a match score (0-100) and a short justification for the match.
+        Analyze and provide:
+        - A match score (0-100)
+        - Key areas from the CV that closely match the job description
+        - Specific gaps or areas where the CV does not meet the job description
+
+        Format your response in a clear and concise summary.
         """
     )
 
     llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, temperature=0)
     chain = LLMChain(llm=llm, prompt=prompt_template)
-    result = chain.run({"jd": jd_text, "cv": cv_text})
+    result = chain.run({"jd": trimmed_jd, "cv": trimmed_cv})
     return result
+
+def truncate_metadata(metadata):
+    import json
+    while True:
+        serialized = json.dumps(metadata)
+        if len(serialized.encode("utf-8")) <= MAX_METADATA_BYTES:
+            return metadata
+        if 'correlation_id' in metadata:
+            metadata['correlation_id'] = metadata['correlation_id'][:36]
+        if 'type' in metadata and len(metadata['type']) > 10:
+            metadata['type'] = metadata['type'][:10]
+        keys = list(metadata.keys())
+        for k in keys:
+            if k not in ['correlation_id', 'type']:
+                del metadata[k]
+                break
 
 # --- Main Execution ---
 if __name__ == "__main__":
@@ -135,7 +180,7 @@ if __name__ == "__main__":
     store_embeddings(CORRELATION_ID, cv_text, jd_text)
 
     print("Matching CV and JD...")
-    result = match_cv_with_jd(CORRELATION_ID, jd_text, cv_text)
+    result = match_cv_with_jd(CORRELATION_ID, cv_text, jd_text)
     print("Result:", result)
 
     result_key = f"results/{CORRELATION_ID}_result.txt"
