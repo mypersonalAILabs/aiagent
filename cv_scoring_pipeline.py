@@ -1,5 +1,6 @@
 import os
 import tempfile
+import json
 import boto3
 from pinecone import Pinecone
 from langchain.embeddings.openai import OpenAIEmbeddings
@@ -49,21 +50,6 @@ def extract_text_from_file(file_path):
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             return f.read()
 
-# --- Store Embeddings ---
-def store_embeddings(correlation_id, cv_text, jd_text):
-    embedding_model = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=750, chunk_overlap=100)
-
-    cv_chunks = text_splitter.split_text(cv_text)
-    jd_chunks = text_splitter.split_text(jd_text)
-
-    texts = cv_chunks + jd_chunks
-    metadatas = [truncate_metadata({"correlation_id": correlation_id, "type": "cv"})] * len(cv_chunks) + \
-                [truncate_metadata({"correlation_id": correlation_id, "type": "jd"})] * len(jd_chunks)
-
-    db = PineconeVectorStore(index=index, embedding=embedding_model, text_key="text")
-    db.add_texts(texts=texts, metadatas=metadatas)
-
 # --- Token counter ---
 def count_tokens(text):
     encoder = encoding_for_model(MODEL_NAME)
@@ -84,16 +70,90 @@ def truncate_to_fit_limit(jd_text, cv_text, max_tokens=MAX_TOKENS, reserved_for_
 
     return encoder.decode(jd_tokens), encoder.decode(cv_tokens)
 
+# --- Metadata Extractors ---
+def extract_metadata_from_jd(text):
+    prompt = PromptTemplate(
+        input_variables=["jd"],
+        template="""
+        Extract the following metadata from the job description below:
+        - Role Title
+        - Required Experience (years)
+        - Tech Stack (as list)
+        - Location
+
+        Job Description:
+        {jd}
+
+        Return as JSON.
+        """
+    )
+    chain = LLMChain(llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, temperature=0), prompt=prompt)
+    return json.loads(chain.run({"jd": text}))
+
+def extract_metadata_from_cv(text):
+    prompt = PromptTemplate(
+        input_variables=["cv"],
+        template="""
+        Extract the following metadata from the CV below:
+        - Total Years of Experience
+        - Tech Stack (as list)
+        - Past Companies
+        - Current Company
+        - Education (Degrees and Institutions)
+
+        CV:
+        {cv}
+
+        Return as JSON.
+        """
+    )
+    chain = LLMChain(llm=ChatOpenAI(openai_api_key=OPENAI_API_KEY, temperature=0), prompt=prompt)
+    return json.loads(chain.run({"cv": text}))
+
+# --- Truncate metadata to fit byte limit ---
+def truncate_metadata(metadata):
+    while True:
+        serialized = json.dumps(metadata)
+        if len(serialized.encode("utf-8")) <= MAX_METADATA_BYTES:
+            return metadata
+        keys = list(metadata.keys())
+        for k in keys:
+            if k not in ['correlation_id', 'type']:
+                del metadata[k]
+                break
+
+# --- Store Embeddings ---
+def store_embeddings(correlation_id, cv_text, jd_text):
+    embedding_model = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=750, chunk_overlap=100)
+
+    cv_chunks = text_splitter.split_text(cv_text)
+    jd_chunks = text_splitter.split_text(jd_text)
+
+    cv_meta = extract_metadata_from_cv(cv_text)
+    jd_meta = extract_metadata_from_jd(jd_text)
+
+    cv_meta['type'] = 'cv'
+    cv_meta['correlation_id'] = correlation_id
+    jd_meta['type'] = 'jd'
+    jd_meta['correlation_id'] = correlation_id
+
+    metadatas = [truncate_metadata(cv_meta.copy()) for _ in cv_chunks] + \
+                [truncate_metadata(jd_meta.copy()) for _ in jd_chunks]
+
+    db = PineconeVectorStore(index=index, embedding=embedding_model, text_key="text")
+    db.add_texts(texts=cv_chunks + jd_chunks, metadatas=metadatas)
+
 # --- Match CV with JD ---
 def match_cv_with_jd(correlation_id, cv_text, jd_text):
     embedding_model = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
     db = PineconeVectorStore(index=index, embedding=embedding_model, text_key="text")
 
-    results = db.similarity_search(query="", k=3, filter={"correlation_id": correlation_id, "type": "jd"})
-    jd_context = "\n".join([r.page_content for r in results]) if results else jd_text
+    jd_local = db.similarity_search("", k=3, filter={"correlation_id": correlation_id, "type": "jd"})
+    jd_context = "\n".join([r.page_content for r in jd_local]) if jd_local else jd_text
 
-    matches = db.similarity_search(jd_context, k=3, filter={"correlation_id": correlation_id, "type": "cv"})
-    cv_context = "\n".join([m.page_content for m in matches]) if matches else cv_text
+    cv_local = db.similarity_search(jd_context, k=3, filter={"correlation_id": correlation_id, "type": "cv"})
+    cv_context = "\n".join([m.page_content for m in cv_local]) if cv_local else cv_text
 
     tokens_used = count_tokens(jd_context) + count_tokens(cv_context)
     remaining_tokens = MAX_TOKENS - tokens_used
@@ -140,22 +200,6 @@ def match_cv_with_jd(correlation_id, cv_text, jd_text):
     chain = LLMChain(llm=llm, prompt=prompt_template)
     result = chain.run({"jd": trimmed_jd, "cv": trimmed_cv})
     return result
-
-def truncate_metadata(metadata):
-    import json
-    while True:
-        serialized = json.dumps(metadata)
-        if len(serialized.encode("utf-8")) <= MAX_METADATA_BYTES:
-            return metadata
-        if 'correlation_id' in metadata:
-            metadata['correlation_id'] = metadata['correlation_id'][:36]
-        if 'type' in metadata and len(metadata['type']) > 10:
-            metadata['type'] = metadata['type'][:10]
-        keys = list(metadata.keys())
-        for k in keys:
-            if k not in ['correlation_id', 'type']:
-                del metadata[k]
-                break
 
 # --- Main Execution ---
 if __name__ == "__main__":
