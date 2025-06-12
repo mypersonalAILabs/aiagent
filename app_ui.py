@@ -119,6 +119,7 @@ if st.button("🔍 Evaluate Fit"):
         correlation_id = result['correlation_id']
         st.session_state["last_correlation_id"] = correlation_id
 
+        status_placeholder = st.empty()
         with st.spinner("⏳ Waiting for result from ECS pipeline..."):
             start = time.time()
             for _ in range(60):
@@ -127,15 +128,11 @@ if st.button("🔍 Evaluate Fit"):
                     st.balloons()
                     st.success("🎯 Fit Score Ready")
                     st.markdown("### 🧠 AI Evaluation Result")
-                    st.markdown(f"""
-                        <div class='result-box'>
-                        <pre style='white-space: pre-wrap;'>{match_result}</pre>
-                        </div>
-                    """, unsafe_allow_html=True)
+                    st.code(match_result, language="text")
                     break
                 time.sleep(1)
                 elapsed = int(time.time() - start)
-                st.info(f"⏱ Waited {elapsed}s so far...")
+                status_placeholder.info(f"⏱ Waited {elapsed}s so far...")
             else:
                 st.error("❌ Result not available. Please try again later.")
                 st.info("You may retry after a minute if result doesn't appear.")
